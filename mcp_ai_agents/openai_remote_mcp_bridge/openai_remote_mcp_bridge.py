@@ -20,6 +20,7 @@ DEFAULT_MAX_TOOL_CALLS = 6
 READ_TIMEOUT_SECONDS = 120
 MAX_TOOL_RESULT_CHARS = 12_000
 MAX_TRACE_CHARS = 500
+MAX_TOOL_PAGES = 100
 OPENAI_FUNCTION_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -44,12 +45,18 @@ async def list_all_tools(session: ClientSession) -> list[Any]:
     """Collect every page returned by MCP tool discovery."""
     tools: list[Any] = []
     cursor = None
-    while True:
+    seen_cursors: set[str] = set()
+    for _ in range(MAX_TOOL_PAGES):
         page = await session.list_tools(cursor=cursor)
         tools.extend(page.tools)
         cursor = getattr(page, "nextCursor", None)
         if not cursor:
             return tools
+        # A server that hands back a cursor it already sent would be asked forever.
+        if cursor in seen_cursors:
+            raise ValueError(f"MCP tool discovery repeated the cursor {cursor!r}.")
+        seen_cursors.add(cursor)
+    raise ValueError(f"MCP tool discovery did not end within {MAX_TOOL_PAGES} pages.")
 
 
 def mcp_tool_to_openai(tool: Any) -> dict[str, Any]:
@@ -77,6 +84,22 @@ def mcp_tool_to_openai(tool: Any) -> dict[str, Any]:
             "parameters": parameters,
         },
     }
+
+
+def argument_errors(arguments: dict[str, Any], input_schema: Any) -> list[str]:
+    """Check tool arguments against the required and allowed keys of the MCP schema."""
+    if not isinstance(input_schema, dict):
+        return []
+    errors = []
+    missing = [key for key in input_schema.get("required") or [] if key not in arguments]
+    if missing:
+        errors.append("missing required argument(s): " + ", ".join(missing))
+    properties = input_schema.get("properties")
+    if input_schema.get("additionalProperties") is False and isinstance(properties, dict):
+        unknown = [key for key in arguments if key not in properties]
+        if unknown:
+            errors.append("unknown argument(s): " + ", ".join(unknown))
+    return errors
 
 
 def tool_result_text(result: Any) -> str:
@@ -142,6 +165,7 @@ async def run_bridge(
                 raise ValueError("The MCP server did not expose any selected tools.")
 
             tool_names = {tool.name for tool in exposed}
+            input_schemas = {tool.name: getattr(tool, "inputSchema", None) for tool in exposed}
             print("[tools] " + ", ".join(sorted(tool_names)))
             print("[convert] MCP inputSchema -> OpenAI function parameters")
             messages: list[dict[str, Any]] = [
@@ -191,6 +215,11 @@ async def run_bridge(
                                 arguments = json.loads(raw_arguments)
                                 if not isinstance(arguments, dict):
                                     raise ValueError("tool arguments must be a JSON object")
+                                # An empty or misspelled call would otherwise reach the
+                                # server unchecked against the tool's own schema.
+                                errors = argument_errors(arguments, input_schemas[name])
+                                if errors:
+                                    raise ValueError("; ".join(errors))
                             except (json.JSONDecodeError, ValueError) as exc:
                                 result_text = f"Error: invalid tool arguments: {exc}"
                             else:
